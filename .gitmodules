@@ -1,0 +1,3 @@
+[submodule "vendor/shengji"]
+	path = vendor/shengji
+	url = git@github.com:elldritch/shengji
