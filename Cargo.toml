@@ -1,0 +1,11 @@
+[package]
+name = "autoshengji"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde_json = "1.0.133"
+tungstenite = { version = "0.24.0", features = ["native-tls"] }
+shengji = { path = "./vendor/shengji/backend"}
+shengji-types = { path = "./vendor/shengji/backend/backend-types" }
+zstd = "0.13.2"
