@@ -1,8 +1,10 @@
-use std::net::TcpStream;
+use std::{iter::repeat, net::TcpStream};
 
 use clap::Parser;
+use rand::seq::SliceRandom as _;
 use shengji::serving_types::{JoinRoom, UserMessage};
 use shengji_core::{game_state::GameState, interactive::Action};
+use shengji_mechanics::{ordered_card::OrderedCard, trick::UnitLike, types::Card};
 use shengji_types::{GameMessage, ZSTD_ZSTD_DICT};
 use tracing::{debug, info, instrument, span, trace, Level};
 use tracing_subscriber::{
@@ -21,6 +23,7 @@ struct Argv {
     name: String,
 }
 
+#[instrument]
 fn main() {
     tracing_subscriber::registry()
         .with(
@@ -48,6 +51,9 @@ fn main() {
     );
 
     // Start in the Initialize phase.
+    //
+    // TODO: I should just handle these phases statelessly, since I get the
+    // whole game state for every phase anyway.
     let span = span!(Level::INFO, "initialize_phase");
     let me = {
         let _enter = span.enter();
@@ -64,7 +70,7 @@ fn main() {
             );
             panic!("Expected Initialize phase, but got: {:#?}", game_state);
         };
-        debug!(?me, "Bot player");
+        info!(?me, "Bot player");
 
         // Wait until we move onto the Draw phase. This might take a few state
         // updates, since each settings change in the Initialize phase results in a
@@ -138,23 +144,149 @@ fn main() {
         }
     }
 
-    // TODO: Play phase
-    // TODO: Start with random play?
+    // In the Play phase, the bot plays random valid tricks.
     let span = span!(Level::INFO, "play_phase");
     let _enter = span.enter();
     info!(?game_state, "Entering Play phase");
-    socket.chat("This is as far as I'm programmed so far. Goodbye!");
-    todo!();
     loop {
-        game_state = socket.read_state();
-        trace!(?game_state, "Updated state");
-        if let GameState::Play(p) = game_state {
-            // if p.next_player().unwrap() == me.id {
-            //     socket.send(UserMessage::Action(Action::PlayCard(0)));
-            // }
+        if let GameState::Play(ref p) = game_state {
+            let trick = p.trick();
+            debug!(?trick, "Current trick");
+
+            let played_cards = trick.played_cards();
+            debug!(?played_cards, "Currently played cards");
+
+            match trick.next_player() {
+                Some(next_player_id) => {
+                    if next_player_id != me.id {
+                        debug!(?next_player_id, "Waiting for next player to play");
+                    } else {
+                        debug!("Playing trick");
+                        let settings = p.propagated();
+                        let hands = p.hands();
+                        let current_hand_counts = hands.get(me.id).unwrap();
+                        debug!(?current_hand_counts, "Current hand");
+                        let current_hand = current_hand_counts
+                            .iter()
+                            .flat_map(|(card, count)| repeat(*card).take(*count))
+                            .collect::<Vec<_>>();
+
+                        match trick.trick_format() {
+                            None => {
+                                assert!(played_cards.len() == 0);
+                                debug!("Starting a new trick");
+
+                                // For now, just play a random card. Any one-card
+                                // starting play will always be valid.
+                                let card = current_hand.choose(&mut rand::thread_rng()).unwrap();
+                                debug!(?card, "Playing card");
+                                socket.send(UserMessage::Action(Action::PlayCards(vec![*card])));
+                            }
+                            Some(trick_format) => {
+                                assert!(played_cards.len() > 0);
+                                debug!(?trick_format, "Following this trick format");
+
+                                let cards_in_trick_suit = current_hand
+                                    .iter()
+                                    .filter(|c| {
+                                        trick_format.trump().effective_suit(**c)
+                                            == trick_format.suit()
+                                    })
+                                    .copied()
+                                    .collect::<Vec<_>>();
+
+                                let matching_play = trick_format
+                                    .decomposition(settings.trick_draw_policy())
+                                    .filter_map(|format| {
+                                        let mut playable = UnitLike::check_play(
+                                            OrderedCard::make_map(
+                                                current_hand.iter().copied(),
+                                                trick_format.trump(),
+                                            ),
+                                            format.iter().cloned(),
+                                            settings.trick_draw_policy(),
+                                        );
+
+                                        playable.next().map(|units| {
+                                            units
+                                                .iter()
+                                                .flat_map(|unit| {
+                                                    unit.iter().flat_map(|(card, count)| {
+                                                        repeat(card.card).take(*count)
+                                                    })
+                                                })
+                                                .collect::<Vec<_>>()
+                                        })
+                                    })
+                                    .next();
+
+                                // TODO: I took this from `core/examples/simulate_play.rs`.
+                                // How the hell does this work?
+                                //
+                                // TODO: FIXME: I don't think this _does_ work. I think I need to write my own logic for this.
+                                let num_required = trick_format.size();
+                                let mut play = match matching_play {
+                                    Some(matching) if matching.len() == num_required => matching,
+                                    Some(_) if num_required >= cards_in_trick_suit.len() => {
+                                        cards_in_trick_suit
+                                    }
+                                    Some(mut matching) => {
+                                        // There are more available cards than required; we must at least
+                                        let mut available_cards = cards_in_trick_suit;
+                                        // pick the matching. Do this inefficiently!
+                                        for m in &matching {
+                                            available_cards.remove(
+                                                available_cards
+                                                    .iter()
+                                                    .position(|c| *c == *m)
+                                                    .unwrap(),
+                                            );
+                                        }
+                                        available_cards.shuffle(&mut rand::thread_rng());
+                                        matching.extend(
+                                            available_cards[0..num_required - matching.len()]
+                                                .iter()
+                                                .copied(),
+                                        );
+
+                                        matching
+                                    }
+                                    None => cards_in_trick_suit,
+                                };
+                                let required_other_cards = num_required - play.len();
+                                if required_other_cards > 0 {
+                                    let mut other_cards =
+                                        Card::cards(current_hand_counts.iter().filter(|(c, _)| {
+                                            trick_format.trump().effective_suit(**c)
+                                                != trick_format.suit()
+                                        }))
+                                        .copied()
+                                        .collect::<Vec<_>>();
+                                    other_cards.shuffle(&mut rand::thread_rng());
+                                    play.extend(
+                                        other_cards[0..required_other_cards].iter().copied(),
+                                    );
+                                }
+
+                                debug!(?play, "Playing cards");
+                                socket.send(UserMessage::Action(Action::PlayCards(play)));
+                            }
+                        }
+                    }
+                }
+                None => {
+                    // This happens when the trick has ended (i.e. been won by
+                    // somebody), but nobody has moved on to the next trick yet
+                    // (i.e. hit the "Finish Trick" button, which sends the
+                    // "EndTrick" action).
+                    debug!("Waiting for next trick");
+                }
+            }
         } else {
             panic!("Unexpected state during Play phase: {:#?}", game_state);
         }
+        game_state = socket.read_state();
+        trace!(?game_state, "Updated state");
     }
 }
 
@@ -226,10 +358,17 @@ impl ShengjiSocket<'_> {
                 trace!(?decompressed, "Decompressed message");
                 let decoded: GameMessage = serde_json::from_slice(&decompressed).unwrap();
                 trace!(?decoded, "Decoded message");
+                match decoded {
+                    GameMessage::Error(err) => {
+                        self.chat(&format!("Whoops, something went wrong! The error message is {:?}. Disconnecting.", err));
+                        panic!("Error from server: {:#?}", err);
+                    }
+                    _ => {}
+                }
                 decoded
             }
             _ => {
-                panic!("Unexpected non-binary message from server: {:#?}", message);
+                panic!("Unexpected message from server: {:#?}", message);
             }
         }
     }

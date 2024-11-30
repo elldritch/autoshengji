@@ -109,9 +109,11 @@ name = "autoshengji"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "rand",
  "serde_json",
  "shengji",
  "shengji-core",
+ "shengji-mechanics",
  "shengji-types",
  "tracing",
  "tracing-subscriber",
