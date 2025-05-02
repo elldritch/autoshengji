@@ -57,22 +57,40 @@ fn main() {
     loop {
         match game_state {
             // Do nothing, and wait for the game to start.
+            //
+            // TODO: Send a message when game settings are unsupported.
             GameState::Initialize(_) => trace!("Waiting for game to start"),
 
             // Draw cards on the bot's turn, but never bid.
             //
-            // TODO: Implement bidding logic.
+            // TODO: Implement bidding logic. TODO: Remember what other players
+            // have bid.
+            //
+            // 2 deck game: All draws:
+            // - If I have a bid in my longest suit, I should bid, as long as
+            //   the longest suit is at least 4 cards
+            //
+            // First draw (optional):
+            // - Tune `n` cards ("at least 4") depending on how much you want to
+            //   grab the dealer (e.g. if you have strong opening hands)
             GameState::Draw(draw_phase) => match draw_phase.next_player() {
                 Ok(next_player_id) => {
                     if next_player_id == bot_player_id {
                         debug!("Drawing card");
                         socket.send(UserMessage::Action(Action::DrawCard));
+                        // Decide whether to bid. We should bid if we have a bid
+                        // for a sufficiently strong suit.
+                        game_state = socket.read_state();
+                        // First, determine whether we even have a bid.
+                        //
+                        // Then, determine whether we want to bid.
                     } else {
                         debug!(?next_player_id, "Waiting for next player to draw");
                     }
                 }
                 Err(e) => {
                     if e.to_string() == "nobody has bid yet" {
+                        // TODO: Is the bid logic here different?
                         debug!("Waiting for bids to be made")
                     } else {
                         panic!("Unexpected error during Draw phase: {}", e)
@@ -82,6 +100,11 @@ fn main() {
 
             // Do nothing. Since the bot never bids, it will never have to
             // exchange cards.
+            //
+            // - Remove whole suits
+            // - More trumps
+            // - More jokers
+            // - Don't bury too many points
             GameState::Exchange(_) => trace!("Waiting for landlord to exchange cards"),
 
             // Play valid tricks at random.
